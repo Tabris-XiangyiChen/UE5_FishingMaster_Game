@@ -1,0 +1,117 @@
+#include "/Engine/Private/Common.ush"
+
+// Texture2D<float4> H0_Texture;
+// RWTexture2D<float4> Ht_Texture;
+Texture2DArray<float4> H0_TextureArray;
+RWTexture2DArray<float4> Ht_TextureArray;
+
+// RWTexture2D<float4> Ht_Slope_Texture;
+RWTexture2DArray<float4> Ht_Slope_TextureArray;
+
+int Resolution;
+
+// float PatchLength;
+//float PatchLengths[4];
+float4 PatchLengths;
+
+float Time;
+float4 TimeScales;
+
+// Complex Multiplication
+// (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+float2 ComplexMultiply(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+[numthreads(16, 16, 1)]
+void TimeSpectrumCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+        return;
+
+    // Multi-Cascade Parameters
+    // Get current cascade level
+    uint CascadeIndex = ThreadId.z;
+    float CurrentPatchLength = PatchLengths[CascadeIndex];
+    float CurrentTimeScale = TimeScales[CascadeIndex];
+
+    float2 n = float2(ThreadId.xy) - float2(Resolution * 0.5f, Resolution * 0.5f);
+    
+    // float2 k = n * (2.0f * PI / PatchLength);
+    // Use current cascade patch length
+    float2 k = n * (2.0f * PI / CurrentPatchLength);
+    float kLength = length(k);
+
+
+    // r, g: Real and imaginary parts of h0(k)
+    // b, a: Real and imaginary parts of h0(-k)
+    // float4 h0_data = H0_Texture.Load(int3((int2) ThreadId.xy, 0));
+    float4 h0_data = H0_TextureArray.Load(int4((int2) ThreadId.xy, CascadeIndex, 0));
+    
+    float2 h0_k = h0_data.xy;
+    float2 h0_minus_k = h0_data.zw;
+
+    // Find the conjugate complex number of h0(-k).
+    float2 h0_minus_k_star = float2(h0_minus_k.x, -h0_minus_k.y);
+
+    //Dispersion Relation: omega = sqrt(g * k)
+    float omega = sqrt(9.81f * max(kLength, 0.0001f));
+
+    // e^(i * omega * t)
+    //float phase = omega * Time;
+    float phase = omega * (Time * CurrentTimeScale);
+    
+    float cos_phase = cos(phase);
+    float sin_phase = sin(phase);
+
+    // e^(i * wt)
+    float2 exp_iwt = float2(cos_phase, sin_phase);
+    // e^(-i * wt)
+    float2 exp_minus_iwt = float2(cos_phase, -sin_phase);
+
+    //  h(k, t) = h0(k) * e^(iwt) + h0*(-k) * e^(-iwt)
+    // Calculate Vertical Z-axis amplitude
+    float2 Dz = ComplexMultiply(h0_k, exp_iwt) + ComplexMultiply(h0_minus_k_star, exp_minus_iwt);
+
+    // Calculate Horizontal XY-axis amplitude
+    // Dxy(k) = -i * (k / |k|) * Dz(k)
+    float2 Dxy = float2(0.0f, 0.0f);
+    if (kLength > 0.0001f)
+    {
+        float kx_norm = k.x / kLength;
+        float ky_norm = k.y / kLength;
+        
+        // Multiply by -i: -i * (x + iy) = y - ix
+        float2 iDz = float2(Dz.y, -Dz.x);
+        
+        // Pack Dx into Real part, Dy into Imaginary part
+        Dxy.x = kx_norm * iDz.x - ky_norm * iDz.y; // Real -> Dx
+        Dxy.y = kx_norm * iDz.y + ky_norm * iDz.x; // Imag -> Dy
+    }
+
+    Ht_TextureArray[int3(ThreadId.xy, CascadeIndex)] = float4(Dz.x, Dz.y, Dxy.x, Dxy.y);
+    
+    // Analytical Slopes
+    // Slope(k) = i * k * Dz(k)
+    float2 SlopeX = float2(0.0f, 0.0f);
+    float2 SlopeY = float2(0.0f, 0.0f);
+    
+    if (kLength > 0.0001f)
+    {
+        // i * (x + iy) = -y + ix
+        // Multiply by i to compute spatial derivative in frequency domain
+        float2 iDz = float2(-Dz.y, Dz.x);
+        
+        // Slope X complex amplitude
+        SlopeX = k.x * iDz;
+        
+        // Slope Y complex amplitude
+        SlopeY = k.y * iDz;
+    }
+    
+    // Write in slope output map
+    // Ht_Slope_Texture[ThreadId.xy] = float4(SlopeX.x, SlopeX.y, SlopeY.x, SlopeY.y);
+    Ht_Slope_TextureArray[int3(ThreadId.xy, CascadeIndex)] = float4(SlopeX.x, SlopeX.y, SlopeY.x, SlopeY.y);
+}

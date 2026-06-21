@@ -1,0 +1,55 @@
+#include "/Engine/Private/Common.ush"
+
+// Texture2D<float4> IFFT_Result; 
+// Texture2D<float4> IFFT_Slope_Result; 
+Texture2DArray<float4> IFFT_ResultArray;
+Texture2DArray<float4> IFFT_Slope_ResultArray;
+
+// RWTexture2D<float4> DisplacementLUT;
+// RWTexture2D<float4> NormalLUT; 
+RWTexture2DArray<float4> DisplacementLUTArray;
+RWTexture2DArray<float4> NormalLUTArray;
+
+int Resolution;
+
+// float ChoppyScale; 
+//float ChoppyScales[4];
+float4 ChoppyScales;
+
+[numthreads(16, 16, 1)]
+void AssembleCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+        return;
+
+    uint CascadeIndex = ThreadId.z;
+    float CurrentChoppyScale = ChoppyScales[CascadeIndex];
+
+    // Read Ifft
+    // float4 h = IFFT_Result.Load(int3((int2) ThreadId.xy, 0));
+    // float4 s = IFFT_Slope_Result.Load(int3((int2) ThreadId.xy, 0)); 
+    float4 h = IFFT_ResultArray.Load(int4((int2) ThreadId.xy, CascadeIndex, 0));
+    float4 s = IFFT_Slope_ResultArray.Load(int4((int2) ThreadId.xy, CascadeIndex, 0));
+
+    // Sign correction: Checkerboard flip
+    float flipSign = ((ThreadId.x + ThreadId.y) % 2 == 1) ? -1.0f : 1.0f;
+    
+    // Extract and scale true 3D spatial displacement
+    float Dz = h.x * flipSign;
+    
+    // B Channel: DX
+    float Dx = -h.z * flipSign * CurrentChoppyScale;
+    float Dy = -h.w * flipSign * CurrentChoppyScale;
+
+    // DisplacementLUT[ThreadId.xy] = float4(Dx, Dy, Dz, 1.0f);
+    DisplacementLUTArray[int3(ThreadId.xy, CascadeIndex)] = float4(Dx, Dy, Dz, 1.0f);
+    
+    // 3Analytical Normal
+    float SlopeX = s.x * flipSign;
+    float SlopeY = s.z * flipSign;
+
+    // Normal = normalize(float3(-SlopeX, -SlopeY, 1.0))
+    float3 normal = normalize(float3(-SlopeX, -SlopeY, 1.0f));
+
+    NormalLUTArray[int3(ThreadId.xy, CascadeIndex)] = float4(normal, 1.0f);
+}

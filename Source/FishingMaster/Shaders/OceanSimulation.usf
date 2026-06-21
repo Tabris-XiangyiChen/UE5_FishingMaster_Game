@@ -1,0 +1,25 @@
+#include "/Engine/Private/Common.ush"
+
+RWTexture2D<float4> OutputTexture;
+int Resolution;
+float Time;
+
+[numthreads(16, 16, 1)]
+void MainCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+    {
+        return;
+    }
+
+    // Normalized UV coordinates [0, 1]
+    float2 uv = float2(ThreadId.xy) / (float) Resolution;
+
+    // Generate a beautiful, moving procedural gradient pattern for testing data pipeline
+    float r = sin(uv.x * 10.0 + Time) * 0.5 + 0.5;
+    float g = cos(uv.y * 10.0 + Time) * 0.5 + 0.5;
+    float b = sin((uv.x + uv.y) * 5.0 - Time) * 0.5 + 0.5;
+
+    // Write directly into the allocated Render Target
+    OutputTexture[ThreadId.xy] = float4(r, g, b, 1.0);
+}

@@ -1,0 +1,186 @@
+#include "/Engine/Private/Common.ush"
+
+#define PI 3.14159265359f
+
+// float 4 for
+RWTexture2DArray<float4> H0_TextureArray;
+
+uint Resolution;
+// 4 cascade different patchlengths
+float4 PatchLengths;
+float4 Amplitudes;
+
+// JONSWAP parameters
+float Alpha;
+float Omega_p;
+float Gamma;
+
+float2 WindDirection;
+float WindDependency;
+float g;
+
+uint Hash(uint state)
+{
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+// Returns a uniform random number in the range [0, 1]
+float Random(inout uint state)
+{
+    return (float) Hash(state) / 4294967295.0;
+}
+
+// Converts uniform distribution to a Gaussian distributed complex number using the Box-Muller transform
+float2 GenerateGaussianRandom(inout uint state)
+{
+    float r1 = max(0.0001f, Random(state));
+    float r2 = Random(state);
+
+    float radius = sqrt(-2.0f * log(r1));
+    float theta = 2.0f * PI * r2;
+
+    return float2(cos(theta), sin(theta)) * radius;
+}
+
+/******************************************************************************
+ * JONSWAP Wave Spectrum Formula
+ *
+ * S(w) = (alpha * g^2 / w^5) * exp(-1.25 * (wp / w)^4) * gamma^r
+ *
+ * where:
+ * r = exp( -((w - wp)^2) / (2 * sigma^2 * wp^2) )
+ * sigma = (w <= wp) ? 0.07 : 0.09
+ *
+ *-----------------------------------------------------------------------------
+ * [中文参数解释]
+ * S(w)  : 能量谱密度。当前频率 w 分配到的海浪能量。
+ * w     : 角频率 (rad/s)。计算当前像素位置对应的波频率。
+ * alpha : 能量尺度常数 (Phillips constant)。控制整体海浪的高度，通常由风速和风区距离推导得出。
+ * g     : 重力加速度。常数 9.81 m/s^2。
+ * wp    : 峰值频率 (Peak frequency)。能量最集中的那个中心频率。
+ * gamma : 谱峰提升因子。通常取 3.3，这个值越大，海浪的高频峰值越尖锐。
+ * r     : 形状指数。用于计算峰值附近的能量分布。
+ * sigma : 谱形参数。用于控制峰值的宽度。当 w <= wp 时取 0.07，当 w > wp 时取 0.09。
+ *
+ *-----------------------------------------------------------------------------
+ * [English Parameters]
+ * S(w)  : Energy spectrum density. The wave energy assigned to frequency w.
+ * w     : Angular frequency (rad/s). The frequency of the current wave.
+ * alpha : Energy scale constant (Phillips constant). Controls the overall wave height, calculated from wind speed and fetch.
+ * g     : Gravity acceleration. Constant 9.81 m/s^2.
+ * wp    : Peak frequency. The frequency where the wave energy is the highest.
+ * gamma : Peak enhancement factor. Usually 3.3. Larger value makes the wave peak sharper.
+ * r     : Shape exponent. Used to calculate energy distribution near the peak.
+ * sigma : Shape parameter for peak width. 0.07 when w <= wp, and 0.09 when w > wp.
+ ******************************************************************************/
+float JONSWAP(float2 k, float CurrentPatchLength, float CurrentAmplitude)
+{
+    float k_length = length(k);
+    if(k_length < 0.0000001f)
+        return 0.0f;
+    
+    // Current wave frequncy
+    float omega = sqrt(g * k_length);
+    
+    float sigma = (omega <= Omega_p) ? 0.07f : 0.09f;
+    //Shape exponent. Used to calculate energy distribution near the peak.
+    float r = exp(-(pow(omega - Omega_p, 2.0f)) / (2 * sigma * sigma * Omega_p * Omega_p));
+    
+    // Caculate frequency domain energy S(w)
+    float S_omega = (Alpha * g * g / pow(omega, 5.0f)) * exp(-1.25f * pow(Omega_p / omega, 4.0f));
+    S_omega *= pow(Gamma, r);
+    
+    float dOmega_dk = g / (2.0f * omega);
+    float S_k = S_omega * dOmega_dk;
+    
+    float kDotW = max(0.0f, dot(normalize(k), WindDirection));
+    float D_theta = kDotW * kDotW;
+    
+    float P_k = (S_k * D_theta) / k_length;
+    
+    float damping = exp(-k_length * k_length * CurrentPatchLength * CurrentPatchLength * WindDependency * WindDependency);
+    return CurrentAmplitude * 1000.0f * P_k * damping;
+}
+
+float ComputeCascadeFilter(float kLength, uint cascadeIdx, float4 patchLengths)
+{
+    float filter = 1.0f;
+    float currentL = patchLengths[cascadeIdx];
+    float k_min = 2.0f * PI / currentL;
+    
+    if (cascadeIdx > 0)
+    {
+        float fadeOutStart = k_min * 0.8f;
+        float fadeOutEnd = k_min * 1.2f;
+        filter *= smoothstep(fadeOutStart, fadeOutEnd, kLength);
+    }
+    
+    if (cascadeIdx < 3)
+    {
+        float nextL = patchLengths[cascadeIdx + 1];
+        float k_max = 2.0f * PI / nextL;
+        float fadeInStart = k_max * 0.8f;
+        float fadeInEnd = k_max * 1.2f;
+        filter *= (1.0f - smoothstep(fadeInStart, fadeInEnd, kLength));
+    }
+    
+    return filter;
+}
+
+[numthreads(16, 16, 1)]
+void InitialSpectrumCs(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+        return;
+    
+    // Use thread id to get current cascade
+    uint cascade_index = ThreadId.z;
+    float current_patchLength = PatchLengths[cascade_index];
+    float current_amplitude = Amplitudes[cascade_index];
+    
+    float2 n = float2(ThreadId.xy) - float2(Resolution * 0.5f, Resolution * 0.5f);
+    
+    // Calculate wave vector k and mirrored wave vector -k
+    float2 k = n * (2.0f * PI / current_patchLength);
+    float2 minus_k = -k;
+    
+    //Get mirrored index for conjugate random numbers
+    uint2 mirrorThreadId = uint2((Resolution - ThreadId.x) % Resolution, (Resolution - ThreadId.y) % Resolution);
+
+    // Generate Gaussian random complex numbers
+    uint randomState1 = ThreadId.x + ThreadId.y * Resolution + cascade_index * 1999u;
+    uint randomState2 = mirrorThreadId.x + mirrorThreadId.y * Resolution + cascade_index * 1999u;
+
+    // Call the extracted function to get Gaussian complex numbers
+    float2 gaussian1 = GenerateGaussianRandom(randomState1);
+    float2 gaussian2 = GenerateGaussianRandom(randomState2);
+    
+    float S_k = 0;
+    float S_minus_k = 0;
+    
+    S_k = JONSWAP(k, current_patchLength, current_amplitude);
+    S_minus_k = JONSWAP(minus_k, current_patchLength, current_amplitude);
+    
+    float k_length = length(k);
+    float filter = ComputeCascadeFilter(k_length, cascade_index, PatchLengths);
+    S_k *= filter;
+    S_minus_k *= filter;
+    
+    float2 h0_k = gaussian1 * sqrt(S_k * 0.5f);
+    float2 h0_minus_k = gaussian2 * sqrt(S_minus_k * 0.5f);
+    
+    // // Set DC component (k=0) to 0 to prevent the entire ocean surface from shifting vertically
+    if (ThreadId.x == Resolution / 2 && ThreadId.y == Resolution / 2)
+    {
+        h0_k = float2(0.0f, 0.0f);
+        h0_minus_k = float2(0.0f, 0.0f);
+    }
+    
+    H0_TextureArray[int3(ThreadId.xy, cascade_index)] = float4(h0_k.x, h0_k.y, h0_minus_k.x, h0_minus_k.y);
+}

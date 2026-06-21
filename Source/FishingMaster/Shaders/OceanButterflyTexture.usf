@@ -1,0 +1,97 @@
+#include "/Engine/Private/Common.ush"
+
+
+// Output Texture
+// R, G: Twiddle Factor Real & Imaginary
+// B, A: \Indices for the two elements to combine
+RWTexture2D<float4> Butterfly_Texture;
+
+int Resolution; // e.g., 256
+
+// Bit Reversal
+uint BitReverse(uint i, uint N)
+{
+    uint j = i;
+    uint Sum = 0;
+    uint W = 1;
+    uint M = N / 2;
+    while (M != 0)
+    {
+        uint b = (j & M) == M ? 1 : 0;
+        Sum += b * W;
+        W *= 2;
+        M /= 2;
+    }
+    return Sum;
+}
+
+[numthreads(1, 16, 1)]
+void ButterflyCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // ThreadId.x = Stage (0 to log2(N)-1)
+    // ThreadId.y = Index (0 to N-1)
+    
+    uint stage = ThreadId.x;
+    uint index = ThreadId.y;
+    
+    if (index >= (uint) Resolution)
+        return;
+    
+    // Calculate step size for current stage
+    uint butterflySpan = 1 << stage;
+    uint butterflyOffset = 1 << (stage + 1);
+    
+    // Determine if the current index is the top or bottom node of the butterfly
+    bool isTopNode = (index % butterflyOffset) < butterflySpan;
+    
+    // Calculate read indices for ping-pong
+    uint topIndex = 0;
+    uint bottomIndex = 0;
+    
+    // In Stage 0, bit-reversed indices
+    if (stage == 0)
+    {
+        if (isTopNode)
+        {
+            topIndex = BitReverse(index, Resolution);
+            bottomIndex = BitReverse(index + butterflySpan, Resolution);
+        }
+        else
+        {
+            topIndex = BitReverse(index - butterflySpan, Resolution);
+            bottomIndex = BitReverse(index, Resolution);
+        }
+    }
+    else
+    {
+        // In subsequent stages, calculate butterfly crossover indices
+        if (isTopNode)
+        {
+            topIndex = index;
+            bottomIndex = index + butterflySpan;
+        }
+        else
+        {
+            topIndex = index - butterflySpan;
+            bottomIndex = index;
+        }
+    }
+    
+    // Calculate Twiddle Factor
+    // Correct Phase formula for IFFT
+    uint k = index % butterflySpan;
+    float twiddlePhase = PI * (float) k / (float) butterflySpan;
+    
+    // Twiddle Factor
+    float2 twiddle = float2(cos(twiddlePhase), sin(twiddlePhase));
+    
+
+    // Because IFFTCS uniformly performs addition, the subtraction for bottom nodes 
+    // must be achieved by negating the Twiddle factor here.
+    if (!isTopNode)
+    {
+        twiddle = -twiddle;
+    }
+    
+    Butterfly_Texture[ThreadId.xy] = float4(twiddle.x, twiddle.y, (float) topIndex, (float) bottomIndex);
+}

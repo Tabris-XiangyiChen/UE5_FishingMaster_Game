@@ -1,0 +1,229 @@
+#include "/Engine/Private/Common.ush"
+
+
+// Output Texture: RG stores h0(k), BA stores h0(-k)
+// RWTexture2D<float4> H0_Texture;
+RWTexture2DArray<float4> H0_TextureArray;
+
+// Grid resolution
+int Resolution;
+
+int NumCascades;
+
+// Physical size of the ocean patch in meters
+// float PatchLength;
+// Global wave amplitude
+// float Amplitude; 
+//float PatchLengths[4];
+//float Amplitudes[4];
+float4 PatchLengths;
+float4 Amplitudes;
+float4 WindAngleOffsets;
+float4 CascadeWindSpeeds;
+
+float WindSpeed;
+float2 WindDirection;
+//  Damping factor for tiny high-frequency waves
+float WindDependency;
+
+//Spectrum 
+// Spectrum Type: 0 for Phillips, 1 for JONSWAP
+int SpectrumType;
+// Fetch length
+float Fetch; 
+float JONSWAP_Gamma;
+
+
+// Random Number Generate
+// PCG Hash
+uint Hash(uint state)
+{
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+// Returns a uniform random number in the range [0, 1]
+float Random(inout uint state)
+{
+    return (float) Hash(state) / 4294967295.0;
+}
+
+
+// Converts uniform distribution to a Gaussian distributed complex number using the Box-Muller transform
+float2 GenerateGaussianRandom(inout uint state)
+{
+    float r1 = max(0.0001f, Random(state));
+    float r2 = Random(state);
+
+    float radius = sqrt(-2.0f * log(r1));
+    float theta = 2.0f * PI * r2;
+
+    return float2(cos(theta), sin(theta)) * radius;
+}
+
+
+//JONSWAP Spectrum Mathematical Model
+// float JONSWAP(float2 k)
+float JONSWAP(float2 k, uint CascadeIndex, float CurrentPatchLength, float CurrentAmplitude)
+{
+    float CurrentWindSpeed = CascadeWindSpeeds[CascadeIndex];
+    
+    float kLength = length(k);
+    if (kLength < 0.0001f)
+        return 0.0f;
+
+    //Physical pre-calculations
+    float g = 9.81f;
+    // Dispersion relation
+    float omega = sqrt(g * kLength); 
+    //float U10 = max(0.1f, WindSpeed);
+    float U10 = max(0.1f, CurrentWindSpeed);
+    
+    // Convert kilometers to meters
+    float F = max(1.0f, Fetch * 1000.0f); 
+
+    // Empirical formulas for core parameters - Hasselmann et al. 1973
+    float x_tilde = (g * F) / (U10 * U10);
+    
+    // Phillips energy scale
+    float alpha = 0.076f * pow(x_tilde, -0.22f);
+    
+    // Peak angular frequency
+    float omega_p = 22.0f * pow(x_tilde, -0.33f) * (g / U10);
+
+    // Calculate Peak Enhancement factor
+    float sigma = (omega <= omega_p) ? 0.07f : 0.09f;
+    float r = exp(-pow(omega - omega_p, 2.0f) / (2.0f * sigma * sigma * omega_p * omega_p));
+
+    // Frequency domain energy S(w)
+    float S_omega = (alpha * g * g / pow(omega, 5.0f)) * exp(-1.25f * pow(omega_p / omega, 4.0f));
+    S_omega *= pow(JONSWAP_Gamma, r);
+
+    // Jacobian: Convert angular frequency spectrum S(w) to wavenumber spectrum S(k)
+    float dOmega_dk = g / (2.0f * omega);
+    float S_k = S_omega * dOmega_dk;
+
+    float CurrentAngleOffset = WindAngleOffsets[CascadeIndex] * (PI / 180.0f);
+
+    // [cos(A) -sin(A); sin(A) cos(A)]
+    float cosA = cos(CurrentAngleOffset);
+    float sinA = sin(CurrentAngleOffset);
+    float2 CascadeWindDir = float2(
+        WindDirection.x * cosA - WindDirection.y * sinA,
+        WindDirection.x * sinA + WindDirection.y * cosA
+    );
+    CascadeWindDir = normalize(CascadeWindDir);
+    
+    // apply Directional Spreading
+    //float kDotW = max(0.0f, dot(normalize(k), WindDirection));
+    float kDotW = max(0.0f, dot(normalize(k), CascadeWindDir));
+    float D_theta = kDotW * kDotW; 
+
+    // Convert to 2D k-space: P(k) = S(k) * D(theta) / kLength)
+    float P_k = (S_k * D_theta) / kLength;
+
+    // Apply amplitude scaling and high-frequency damping
+    // float damping = exp(-kLength * kLength * PatchLength * PatchLength * WindDependency * WindDependency);
+    // return Amplitude * 1000.0f * P_k * damping;
+    float damping = exp(-kLength * kLength * CurrentPatchLength * CurrentPatchLength * WindDependency * WindDependency);
+    return CurrentAmplitude * 1000.0f * P_k * damping;
+}
+
+
+
+[numthreads(16, 16, 1)]
+void InitialSpectrumCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+        return;
+
+    // Cascade Parameters
+    uint CascadeIndex = ThreadId.z;
+    float CurrentPatchLength = PatchLengths[CascadeIndex];
+    float CurrentAmplitude = Amplitudes[CascadeIndex];
+    
+    float CurrentAngleOffset = WindAngleOffsets[CascadeIndex] * (PI / 180.0f);
+
+    float cosA = cos(CurrentAngleOffset);
+    float sinA = sin(CurrentAngleOffset);
+    float2 CascadeWindDir = float2(
+        WindDirection.x * cosA - WindDirection.y * sinA,
+        WindDirection.x * sinA + WindDirection.y * cosA
+    );
+    CascadeWindDir = normalize(CascadeWindDir);
+
+    // Calculate wave vector k and mirrored wave vector -k
+    // FFT requires the frequency center at the grid origin, hence subtracting Resolution / 2
+    float2 n = float2(ThreadId.xy) - float2(Resolution * 0.5f, Resolution * 0.5f);
+    
+    // float2 k = n * (2.0f * PI / PatchLength);
+    // Use current cascade patch length
+    float2 k = n * (2.0f * PI / CurrentPatchLength);
+    float2 minus_k = -k;
+
+    // Get mirrored index for conjugate random numbers
+    uint2 mirrorThreadId = uint2((Resolution - ThreadId.x) % Resolution, (Resolution - ThreadId.y) % Resolution);
+
+    //Generate Gaussian random complex numbers
+    uint randomState1 = ThreadId.x + ThreadId.y * Resolution + CascadeIndex * 1999u;
+    uint randomState2 = mirrorThreadId.x + mirrorThreadId.y * Resolution + CascadeIndex * 1999u;
+
+    float2 gaussian1 = GenerateGaussianRandom(randomState1);
+    float2 gaussian2 = GenerateGaussianRandom(randomState2);
+
+    // Calculate h0(k) and h0(-k)
+    float P_k = 0;
+    float P_minus_k = 0;
+
+
+    // P_k = JONSWAP(k);
+    // P_minus_k = JONSWAP(minus_k);
+    P_k = JONSWAP(k, CascadeIndex, CurrentPatchLength, CurrentAmplitude);
+    P_minus_k = JONSWAP(minus_k, CascadeIndex, CurrentPatchLength, CurrentAmplitude);
+
+    // Filter (Didnt use this because its hard to adjust the parametes)
+    float kLength = length(k);
+    float filter = 1.0f;
+    
+    if (CascadeIndex > 0)
+    {
+        float prevPatchLength = PatchLengths[CascadeIndex - 1];
+        float k_prev = 2.0f * PI / prevPatchLength;
+        filter *= smoothstep(k_prev * 0.5f, k_prev * 1.5f, kLength);
+    }
+    
+
+    if ((int) CascadeIndex < (NumCascades - 1))
+    {
+        float nextPatchLength = PatchLengths[CascadeIndex + 1];
+
+        float k_next = 2.0f * PI / nextPatchLength;
+
+        filter *= (1.0f - smoothstep(k_next * 0.5f, k_next * 1.5f, kLength));
+    }
+
+    //P_k *= filter;
+    //P_minus_k *= filter;
+
+    // ombine with random phase to generate initial complex amplitude
+    float2 h0_k = gaussian1 * sqrt(P_k * 0.5f);
+    float2 h0_minus_k = gaussian2 * sqrt(P_minus_k * 0.5f);
+    //float2 h0_minus_k = float2(h0_k.x, -h0_k.y);
+
+
+    // Set DC component (k=0) to 0 to prevent the entire ocean surface from shifting vertically
+    if (ThreadId.x == Resolution / 2 && ThreadId.y == Resolution / 2)
+    {
+        h0_k = float2(0.0f, 0.0f);
+        h0_minus_k = float2(0.0f, 0.0f);
+    }
+    
+    // Write into texture
+    H0_TextureArray[int3(ThreadId.xy, CascadeIndex)] = float4(h0_k.x, h0_k.y, h0_minus_k.x, h0_minus_k.y);
+}

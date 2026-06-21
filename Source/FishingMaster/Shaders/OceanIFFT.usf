@@ -1,0 +1,65 @@
+#include "/Engine/Private/Common.ush"
+
+
+Texture2D<float4> Butterfly_Texture;
+
+// Texture2D<float4> Input_Texture;
+// RWTexture2D<float4> Output_Texture;
+Texture2DArray<float4> Input_TextureArray;
+RWTexture2DArray<float4> Output_TextureArray;
+
+// Current iteration stage: 0 to log2(N)-1
+int Stage; 
+// 0: Horizontal, 1:Vertical
+int Direction;
+ // Resolution
+int Resolution; 
+
+// Complex Multiplication
+float2 ComplexMultiply(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+[numthreads(16, 16, 1)]
+void IFFTCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if ((int) ThreadId.x >= Resolution || (int) ThreadId.y >= Resolution)
+        return;
+
+    uint2 pos = ThreadId.xy;
+    
+    // Get current cascade level
+    uint CascadeIndex = ThreadId.z;
+    
+    // Determine lookup index based on direction
+    uint idx = (Direction == 0) ? pos.x : pos.y;
+
+    // Read Butterfly Codebook
+    // Butterfly_Texture: x,y Twiddle, z Top, w Bottom
+    //  3rd parameter is 0 for mip_level, as the codebook is a single 2D texture
+    float4 butterfly = Butterfly_Texture.Load(int3(Stage, (int) idx, 0));
+    float2 twiddle = butterfly.xy;
+    uint idxTop = (uint) butterfly.z;
+    uint idxBottom = (uint) butterfly.w;
+
+    // Assemble input pixel coordinates
+    uint2 posTop = (Direction == 0) ? uint2(idxTop, pos.y) : uint2(pos.x, idxTop);
+    uint2 posBottom = (Direction == 0) ? uint2(idxBottom, pos.y) : uint2(pos.x, idxBottom);
+    
+    // Read float4 data
+    // float4 top = Input_Texture.Load(int3((int2) posTop, 0));
+    // float4 bottom = Input_Texture.Load(int3((int2) posBottom, 0));
+    float4 top = Input_TextureArray.Load(int4((int2) posTop, CascadeIndex, 0));
+    float4 bottom = Input_TextureArray.Load(int4((int2) posBottom, CascadeIndex, 0));
+
+
+
+    // Perform butterfly operation on both Z and XY data simultaneously
+    float2 resultZ = top.xy + ComplexMultiply(twiddle, bottom.xy);
+    float2 resultXY = top.zw + ComplexMultiply(twiddle, bottom.zw);
+
+    // Write combined result
+    // Output_Texture[pos] = float4(resultZ, resultXY);
+    Output_TextureArray[int3(pos, CascadeIndex)] = float4(resultZ, resultXY);
+}
