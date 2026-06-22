@@ -66,7 +66,7 @@ void UQuestManagerComponent::ReportAction(FName FishRowName, int32 Count, bool b
             switch (Objective.ObjectiveType)
             {
                 case EQuestObjectiveType::CatchSpecificFish:
-                    if (bIsBombedCollection && Objective.TargetFish.RowName == FishRowName)
+                    if (Objective.TargetFish.RowName == FishRowName)
                     {
                         bObjectiveMatched = true;
                     }
